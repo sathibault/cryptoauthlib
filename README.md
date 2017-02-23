@@ -6,6 +6,16 @@ for the Arduino platform.
 
 This is **beta** release, see disclaimer below.
 
+## Installation
+
+1. Download the CryptoAuthLib-v*xyz*.zip from the [latest release](https://github.com/sathibault/cryptoauthlib/releases)
+2. From Arduino IDE menu select Sketch -> Include library -> Add .ZIP library and select the downloaded file.
+
+## Examples
+
+See provision_sha204 for an example of provisioning a device and using
+it to computing challenge responses.
+
 ## License
 
 Redistribution and use in source and binary forms, with or without
