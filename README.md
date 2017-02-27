@@ -14,7 +14,12 @@ This is **beta** release, see disclaimer below.
 ## Examples
 
 See provision_sha204 for an example of provisioning a device and using
-it to computing challenge responses.
+it to computing challenge responses with symmetric keys with the
+ATSHA204A chip.
+
+See provision_ecc108 for an example of provisioning a device and using
+it to generate private/public key pairs, signing messages, and
+validating signed messages with the ATECC108A chip.
 
 ## License
 
