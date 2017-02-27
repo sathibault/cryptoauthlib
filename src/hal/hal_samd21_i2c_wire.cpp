@@ -9,6 +9,8 @@
 
 #define DEBUG_LOG( x )
 
+#define WIRE_BUF_MAX (SERIAL_BUFFER_SIZE-1)
+
 extern "C" ATCA_STATUS hal_i2c_init(void *hal, ATCAIfaceCfg *cfg);
 extern "C" ATCA_STATUS hal_i2c_wake(ATCAIface iface);
 extern "C" ATCA_STATUS hal_i2c_idle(ATCAIface iface);
@@ -23,6 +25,11 @@ static uint8_t revs108[2][4] = { { 0x80, 0x00, 0x10, 0x01 },
 static uint8_t revs204[3][4] = { { 0x00, 0x02, 0x00, 0x08 },
 				 { 0x00, 0x02, 0x00, 0x09 },
 				 { 0x00, 0x04, 0x05, 0x00 } };
+
+extern "C" void debug_out(const char *msg, int arg) {
+  Serial.print(msg);
+  Serial.println(arg,HEX);
+}
 
 extern "C" ATCA_STATUS hal_i2c_discover_devices(int busNum, ATCAIfaceCfg *cfg, int *found)
 {
@@ -126,54 +133,99 @@ extern "C" ATCA_STATUS hal_i2c_post_init(ATCAIface iface)
 	return ATCA_SUCCESS;
 }
 
+uint8_t send_oversized(uint8_t txAddress, uint8_t *data, int size)
+{
+  if (!PERIPH_WIRE.startTransmissionWIRE(txAddress, WIRE_WRITE_FLAG)) {
+    PERIPH_WIRE.prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
+    return 2 ;  // Address error
+  }
+
+  for (int i = 0; i < size; i++) {
+    if (!PERIPH_WIRE.sendDataMasterWIRE(data[i])) {
+      PERIPH_WIRE.prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
+      return 3 ;  // Nack or error
+    }
+  }
+
+  PERIPH_WIRE.prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
+
+  return 0;
+}
+
 extern "C" ATCA_STATUS hal_i2c_send(ATCAIface iface, uint8_t *txdata, int txlength)
 {
+  int res;
   ATCAIfaceCfg *cfg = atgetifacecfg(iface);
-  
-  DEBUG_LOG( Serial.print("> "); )
-  DEBUG_LOG( Serial.println(cfg->atcai2c.slave_address >> 1, HEX); )
+
+  DEBUG_LOG( Serial.print(cfg->atcai2c.slave_address >> 1, HEX); )
+  DEBUG_LOG( Serial.print(" > "); )
 
   txdata[0] = 0x03;   // insert the Word Address Value, Command token
   txlength++;
-  
-  // txdata has ATCAPacket format
-  Wire.beginTransmission(cfg->atcai2c.slave_address >> 1);
-  for (int i = 0; i < txlength; i++)
-    Wire.write(txdata[i]);
-  Wire.endTransmission();
-  
+
+  if (txlength <= WIRE_BUF_MAX) {
+    Wire.beginTransmission(cfg->atcai2c.slave_address >> 1);
+    for (uint8_t i = 0; i < txlength; i++) {
+      if (!Wire.write(txdata[i]))
+	Serial.println("Wire.write overflow");
+    }
+    res = Wire.endTransmission();
+  } else
+    res = send_oversized(cfg->atcai2c.slave_address >> 1, txdata, txlength);
+  if (res != 0)
+    return ATCA_COMM_FAIL;
+
+  DEBUG_LOG( Serial.println(txlength); )
+
   return ATCA_SUCCESS;
 }
 
 extern "C" ATCA_STATUS hal_i2c_receive( ATCAIface iface, uint8_t *rxdata, uint16_t *rxlength)
 {
-  uint16_t i;
   ATCAIfaceCfg *cfg = atgetifacecfg(iface);
-  
+  int retries = cfg->rx_retries;
+
   DEBUG_LOG( Serial.print(cfg->atcai2c.slave_address >> 1, HEX); )
   DEBUG_LOG( Serial.print(" < "); )
 
   // Get length of response
-  Wire.requestFrom(cfg->atcai2c.slave_address >> 1, 1);
+  while (Wire.requestFrom(cfg->atcai2c.slave_address >> 1, 1) == 0 &&
+	 retries > 0) {
+    delay(100);
+    retries--;
+  }
+  if (retries < cfg->rx_retries) {
+    Serial.print(cfg->rx_retries - retries);
+    Serial.print( " retries");
+  }
+  if (retries == 0) {
+    Serial.println("no reponse error");
+    return ATCA_COMM_FAIL;
+  }
   if (Wire.available() != 1) {
-    Serial.println("no count");
+    Serial.print("invalid response ");
     return ATCA_COMM_FAIL;
   }
   rxdata[0] = Wire.read();
 
-  Wire.requestFrom(cfg->atcai2c.slave_address >> 1, rxdata[0]-1);
-  if (Wire.available() != (rxdata[0]-1)) {
-    Serial.println("no data");
-    return ATCA_COMM_FAIL;
-  }
-  
-  for (int i = 1; i < rxdata[0] && i < *rxlength; i++) {
-    rxdata[i] = Wire.read();
-    DEBUG_LOG( Serial.print(":"); )
-    DEBUG_LOG( Serial.print(rxdata[i], HEX); )
+  uint8_t bufpos = 1;
+  uint8_t todo = rxdata[0]-1;
+  while (todo > 0) {
+    uint8_t n = todo <= WIRE_BUF_MAX ? todo : WIRE_BUF_MAX;
+    Wire.requestFrom(cfg->atcai2c.slave_address >> 1, n);
+    if (Wire.available() != n) {
+      Serial.println("response size error");
+      return ATCA_COMM_FAIL;
+    }
+    for (uint8_t i = 0; i < n && bufpos < *rxlength; i++, bufpos++) {
+      rxdata[bufpos] = Wire.read();
+      DEBUG_LOG( Serial.print(":"); )
+      DEBUG_LOG( Serial.print(rxdata[bufpos], HEX); )
+    }
+    todo -= n;
   }
   DEBUG_LOG( Serial.println(); )
-  
+
   return ATCA_SUCCESS;
 }
 
@@ -184,27 +236,32 @@ extern "C" ATCA_STATUS hal_i2c_wake(ATCAIface iface)
   int retries = cfg->rx_retries;
   uint8_t data[4], expected[4] = {0x04, 0x11, 0x33, 0x43};
 
-  if (wake_complete)
-    return ATCA_SUCCESS;
-
   DEBUG_LOG( Serial.print("wake "); )
   DEBUG_LOG( Serial.println(cfg->atcai2c.slave_address >> 1, HEX); )
 
   Wire.beginTransmission(0x00);
   Wire.endTransmission();
-  
+
   atca_delay_us(cfg->wake_delay);
-  
+
   while (Wire.requestFrom(cfg->atcai2c.slave_address >> 1, 4) == 0 &&
-	 retries > 0)
+	 retries > 0) {
+    delay(100);
     retries--;
+  }
+  if (retries == 0) {
+    Serial.println("no response");
+    return ATCA_COMM_FAIL;
+  }
 
   if (Wire.available() != 4) {
     Serial.print("invalid response ");
     Serial.println(Wire.available());
     return ATCA_COMM_FAIL;
   }
-  
+
+  if (wake_complete)
+    return ATCA_SUCCESS;
   wake_complete = true;
 
   for (int i = 0; i < 4; i++)
@@ -218,14 +275,14 @@ extern "C" ATCA_STATUS hal_i2c_wake(ATCAIface iface)
     Serial.print(data[i], HEX);
   }
   Serial.println("");
-  
+
   return ATCA_COMM_FAIL;
 }
 
 extern "C" ATCA_STATUS hal_i2c_idle(ATCAIface iface)
 {
   ATCAIfaceCfg *cfg = atgetifacecfg(iface);
-  
+
   DEBUG_LOG( Serial.print("idle "); )
   DEBUG_LOG( Serial.println(cfg->atcai2c.slave_address >> 1, HEX); )
 
@@ -233,7 +290,7 @@ extern "C" ATCA_STATUS hal_i2c_idle(ATCAIface iface)
   Wire.write(0x02); // idle word address value
   Wire.endTransmission();
   wake_complete = false;
-  
+
   return ATCA_SUCCESS;
 }
 
@@ -248,7 +305,7 @@ extern "C" ATCA_STATUS hal_i2c_sleep(ATCAIface iface)
   Wire.write(0x01); // sleep word address value
   Wire.endTransmission();
   wake_complete = false;
-  
+
   return ATCA_SUCCESS;
 }
 
